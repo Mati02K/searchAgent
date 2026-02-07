@@ -7,6 +7,7 @@ from uuid import uuid4
 class AgentState(TypedDict):
     prompt: str
     plan: list[str]
+    tool_decision: list[str]
     queries: list[str]
     sources: list[dict]
     evidence: list[dict]
@@ -20,6 +21,7 @@ def init_state(prompt: str) -> AgentState:
     return {
         "prompt": prompt,
         "plan": [],
+        "tool_decision": [],
         "queries": [],
         "sources": [],
         "evidence": [],

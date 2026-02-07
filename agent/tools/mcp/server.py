@@ -161,48 +161,52 @@ def _run_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
-    request_id = message.get("id")
-    method = message.get("method")
-    params = message.get("params") or {}
+    try:
+        request_id = message.get("id")
+        method = message.get("method")
+        params = message.get("params") or {}
 
-    if method == "notifications/initialized":
-        return None
+        if method == "notifications/initialized":
+            return None
 
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "search-tools-mcp", "version": "0.1.0"},
-            },
-        }
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "search-tools-mcp", "version": "0.1.0"},
+                },
+            }
 
-    if method == "ping":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
 
-    if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "tools": [_tool_to_mcp_spec(spec) for spec in TOOLS.values()],
-            },
-        }
+        if method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [_tool_to_mcp_spec(spec) for spec in TOOLS.values()],
+                },
+            }
 
-    if method == "tools/call":
-        name = str(params.get("name") or "")
-        arguments = params.get("arguments")
-        if not isinstance(arguments, dict):
-            arguments = {}
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": _run_tool(name, arguments),
-        }
+        if method == "tools/call":
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": _run_tool(name, arguments),
+            }
 
-    return _build_error_response(request_id, -32601, f"Method not found: {method}")
+        return _build_error_response(request_id, -32601, f"Method not found: {method}")
+    except Exception as exc:
+        print(f"[mcp] error handling request: {exc}")
+        return _build_error_response(None, -32603, f"Internal error: {exc}")    
 
 
 def serve() -> None:

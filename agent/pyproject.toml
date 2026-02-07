@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["nodes*", "llm*", "tools*", "scripts*", "safety*"]
+include = ["nodes*", "llm*", "tools*", "scripts*"]

@@ -4,7 +4,7 @@ import contextlib
 import io
 import os
 
-from safety.base import SafetyClassifier, SafetyResult
+from nodes.safety.base import SafetyClassifier, SafetyResult
 
 
 class TransformersSafetyClassifier(SafetyClassifier):
@@ -49,53 +49,61 @@ class TransformersSafetyClassifier(SafetyClassifier):
             )
 
     def evaluate(self, prompt: str) -> SafetyResult:
-        raw = self._pipeline(prompt, truncation=True, top_k=None)
+        try:
+            raw = self._pipeline(prompt, truncation=True, top_k=None)
 
-        candidates: list[dict] = []
-        if isinstance(raw, list) and raw and isinstance(raw[0], list):
-            candidates = [item for item in raw[0] if isinstance(item, dict)]
-        elif isinstance(raw, list):
-            candidates = [item for item in raw if isinstance(item, dict)]
-        elif isinstance(raw, dict):
-            candidates = [raw]
+            candidates: list[dict] = []
+            if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                candidates = [item for item in raw[0] if isinstance(item, dict)]
+            elif isinstance(raw, list):
+                candidates = [item for item in raw if isinstance(item, dict)]
+            elif isinstance(raw, dict):
+                candidates = [raw]
 
-        label_scores: dict[str, float] = {}
-        for item in candidates:
-            label = str(item.get("label", "")).strip().lower().replace(" ", "_")
-            score = float(item.get("score", 0.0))
-            if label:
-                label_scores[label] = max(score, label_scores.get(label, 0.0))
+            label_scores: dict[str, float] = {}
+            for item in candidates:
+                label = str(item.get("label", "")).strip().lower().replace(" ", "_")
+                score = float(item.get("score", 0.0))
+                if label:
+                    label_scores[label] = max(score, label_scores.get(label, 0.0))
 
-        flagged = [
-            (label, score)
-            for label, score in label_scores.items()
-            if label in self.block_labels and score >= self.threshold
-        ]
+            flagged = [
+                (label, score)
+                for label, score in label_scores.items()
+                if label in self.block_labels and score >= self.threshold
+            ]
 
-        if flagged:
-            details = ", ".join(f"{label}={score:.2f}" for label, score in sorted(flagged))
-            return SafetyResult(
-                allowed=False,
-                reason=f"Prompt blocked by model classifier: {details}.",
-                matched_terms=[],
-                classifier=f"transformers:{self.model_name}",
-            )
+            if flagged:
+                details = ", ".join(f"{label}={score:.2f}" for label, score in sorted(flagged))
+                return SafetyResult(
+                    allowed=False,
+                    reason=f"Prompt blocked by model classifier: {details}.",
+                    matched_terms=[],
+                    classifier=f"transformers:{self.model_name}",
+                )
 
-        if label_scores:
-            top_label, top_score = max(label_scores.items(), key=lambda item: item[1])
+            if label_scores:
+                top_label, top_score = max(label_scores.items(), key=lambda item: item[1])
+                return SafetyResult(
+                    allowed=True,
+                    reason=f"Prompt passed model classifier: {top_label} ({top_score:.2f}).",
+                    matched_terms=[],
+                    classifier=f"transformers:{self.model_name}",
+                )
+
             return SafetyResult(
                 allowed=True,
-                reason=f"Prompt passed model classifier: {top_label} ({top_score:.2f}).",
+                reason="Prompt passed model classifier: no label scores returned.",
                 matched_terms=[],
                 classifier=f"transformers:{self.model_name}",
             )
-
-        return SafetyResult(
-            allowed=True,
-            reason="Prompt passed model classifier: no label scores returned.",
-            matched_terms=[],
-            classifier=f"transformers:{self.model_name}",
-        )
+        except Exception as exc:
+            return SafetyResult(
+                allowed=False,
+                reason=f"Model classifier failure: {exc}",
+                matched_terms=[],
+                classifier=f"transformers:{self.model_name}",
+            )
 
 
 def build_optional_model_classifier() -> SafetyClassifier | None:
@@ -106,7 +114,11 @@ def build_optional_model_classifier() -> SafetyClassifier | None:
         return None
 
     model_name = os.getenv("SAFETY_MODEL_NAME", "unitary/toxic-bert")
-    threshold = float(os.getenv("SAFETY_MODEL_THRESHOLD", "0.75"))
+    try:
+        threshold = float(os.getenv("SAFETY_MODEL_THRESHOLD", "0.75"))
+    except Exception:
+        threshold = 0.75
+
     try:
         return TransformersSafetyClassifier(model_name=model_name, threshold=threshold)
     except Exception:
