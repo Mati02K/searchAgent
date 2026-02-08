@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
 
+from logging_utils import get_logger
 
-WIKIPEDIA_REST_SEARCH_ENDPOINTS = (
-    "https://en.wikipedia.org/w/rest.php/v1/search/title",
-    "https://en.wikipedia.org/w/rest.php/v1/search/page",
+logger = get_logger(__name__)
+
+WIKIPEDIA_REST_SEARCH_ENDPOINTS = tuple(
+    endpoint.strip()
+    for endpoint in os.getenv(
+        "WIKIPEDIA_REST_SEARCH_ENDPOINTS",
+        "https://en.wikipedia.org/w/rest.php/v1/search/title,https://en.wikipedia.org/w/rest.php/v1/search/page",
+    ).split(",")
+    if endpoint.strip()
 )
-WIKIPEDIA_SUMMARY_ENDPOINT = "https://en.wikipedia.org/api/rest_v1/page/summary"
+WIKIPEDIA_SUMMARY_ENDPOINT = os.getenv(
+    "WIKIPEDIA_SUMMARY_ENDPOINT",
+    "https://en.wikipedia.org/api/rest_v1/page/summary",
+).rstrip("/")
 
 
 def _http_get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
@@ -35,12 +47,18 @@ def _extract_search_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _get_page_summary(title: str) -> dict[str, Any] | None:
+    started_at = time.perf_counter()
     encoded_title = urllib.parse.quote(title, safe="")
     url = f"{WIKIPEDIA_SUMMARY_ENDPOINT}/{encoded_title}"
     try:
         payload = _http_get_json(url)
     except Exception as exc:
-        print(f"[wikipedia] summary fetch failed for '{title}': {exc}")
+        logger.warning(
+            "Wikipedia summary fetch failed. title=%s error=%s elapsed_ms=%.2f",
+            title,
+            exc,
+            (time.perf_counter() - started_at) * 1000,
+        )
         return None
 
     page_title = str(payload.get("title") or title).strip()
@@ -54,7 +72,7 @@ def _get_page_summary(title: str) -> dict[str, Any] | None:
     if not url_value:
         url_value = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(page_title.replace(' ', '_'))}"
 
-    return {
+    result = {
         "title": page_title,
         "summary": summary,
         "url": url_value,
@@ -62,6 +80,12 @@ def _get_page_summary(title: str) -> dict[str, Any] | None:
         "published": None,
         "authors": None,
     }
+    logger.info(
+        "Wikipedia summary fetched. title=%s elapsed_ms=%.2f",
+        page_title,
+        (time.perf_counter() - started_at) * 1000,
+    )
+    return result
 
 
 def search_wikipedia(query: str, limit: int = 5) -> list[dict]:
@@ -71,8 +95,13 @@ def search_wikipedia(query: str, limit: int = 5) -> list[dict]:
     Returns structured results with schema:
     title, summary, url, source, published, authors.
     """
+    started_at = time.perf_counter()
     cleaned_query = (query or "").strip()
     if not cleaned_query:
+        logger.info(
+            "Wikipedia search called with empty query. elapsed_ms=%.2f",
+            (time.perf_counter() - started_at) * 1000,
+        )
         return []
 
     try:
@@ -81,6 +110,7 @@ def search_wikipedia(query: str, limit: int = 5) -> list[dict]:
         max_results = 5
 
     search_items: list[dict[str, Any]] = []
+    logger.info("Wikipedia search start. query=%s limit=%d", cleaned_query, max_results)
     for endpoint in WIKIPEDIA_REST_SEARCH_ENDPOINTS:
         search_url = (
             f"{endpoint}?q={urllib.parse.quote(cleaned_query)}&limit={max_results}"
@@ -91,25 +121,14 @@ def search_wikipedia(query: str, limit: int = 5) -> list[dict]:
             if search_items:
                 break
         except Exception as exc:
-            print(f"[wikipedia] search failed via '{endpoint}': {exc}")
+            logger.warning("Wikipedia search failed. endpoint=%s error=%s", endpoint, exc)
 
     if not search_items:
-        # Fallback to official MediaWiki Action API if REST search is unavailable.
-        fallback_url = (
-            "https://en.wikipedia.org/w/api.php?"
-            f"action=query&list=search&format=json&srlimit={max_results}&srsearch={urllib.parse.quote(cleaned_query)}"
+        logger.info(
+            "Wikipedia search returned no search items. query=%s elapsed_ms=%.2f",
+            cleaned_query,
+            (time.perf_counter() - started_at) * 1000,
         )
-        try:
-            payload = _http_get_json(fallback_url)
-            query_block = payload.get("query")
-            if isinstance(query_block, dict):
-                values = query_block.get("search")
-                if isinstance(values, list):
-                    search_items = [item for item in values if isinstance(item, dict)]
-        except Exception as exc:
-            print(f"[wikipedia] fallback search failed: {exc}")
-
-    if not search_items:
         return []
 
     titles: list[str] = []
@@ -128,4 +147,10 @@ def search_wikipedia(query: str, limit: int = 5) -> list[dict]:
         if len(results) >= max_results:
             break
 
+    logger.info(
+        "Wikipedia search complete. query=%s results=%d elapsed_ms=%.2f",
+        cleaned_query,
+        len(results),
+        (time.perf_counter() - started_at) * 1000,
+    )
     return results
