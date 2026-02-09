@@ -24,11 +24,14 @@ services:
     build:
       context: .
       dockerfile: agent/Dockerfile
+    working_dir: /workspace/agent
     env_file:
       - ./agent/.env
-    command: ["uv", "run", "python", "-m", "tools.mcp.server", "--transport", "http", "--host", "0.0.0.0", "--port", "8765"]
+    command: ["uv", "run", "--project", "/workspace/agent", "python", "-m", "tools.mcp.server", "--transport", "http", "--host", "0.0.0.0", "--port", "8765"]
     ports:
       - "8765:8765"
+    volumes:
+      - ./logs:/workspace/logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health', timeout=2)"]
       interval: 10s
@@ -42,6 +45,7 @@ services:
     build:
       context: .
       dockerfile: agent/Dockerfile
+    working_dir: /workspace
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -51,9 +55,9 @@ services:
       - ./agent/.env
     volumes:
       - ./logs:/workspace/logs
-    stdin_open: true
-    tty: true
-    command: ["uv", "run", "python", "-m", "scripts.run_graph_smoke", "--debug"]
+    ports:
+      - "8000:8000"
+    command: ["uv", "run", "--project", "/workspace/agent", "uvicorn", "api.api:app", "--host", "0.0.0.0", "--port", "8000"]
     networks:
       - search-agent-net
 

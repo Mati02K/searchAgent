@@ -11,6 +11,30 @@ logger = get_logger(__name__)
 MIN_SOURCES_FOR_LLM = max(1, int(os.getenv("MIN_SOURCES_FOR_LLM", "4")))
 
 
+def _is_likely_rate_limit_error(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    if not text:
+        return False
+    signals = (
+        "429",
+        "rate limit",
+        "quota",
+        "resource_exhausted",
+        "resource exhausted",
+        "too many requests",
+    )
+    return any(signal in text for signal in signals)
+
+
+def _rate_limit_report() -> str:
+    return (
+        "# LLM Rate Limited\n\n"
+        "Gemini API is currently rate-limited.\n\n"
+        "- Please try again after some time.\n"
+        "- Or use a different API key with available quota.\n"
+    )
+
+
 def search_node(state: AgentState) -> dict:
     """
     Final synthesis node.
@@ -76,8 +100,17 @@ def search_node(state: AgentState) -> dict:
         response = llm.generate(llm_prompt, system=FINAL_SYNTHESIS_SYSTEM_PROMPT)
         report = (response.text or "").strip()
         if not report:
-            errors.append("Final synthesis LLM returned empty output.")
-            logger.warning("Final synthesis LLM returned empty output.")
+            raw = response.raw if isinstance(response.raw, dict) else {}
+            llm_error = str(raw.get("error", "")).strip()
+            if _is_likely_rate_limit_error(llm_error):
+                errors.append(
+                    "Gemini API rate-limited. Please try again later or use a different API key."
+                )
+                report = _rate_limit_report()
+                logger.warning("Gemini rate limit detected during final synthesis. error=%s", llm_error)
+            else:
+                errors.append("Final synthesis LLM returned empty output.")
+                logger.warning("Final synthesis LLM returned empty output. error=%s", llm_error)
     except Exception as exc:
         errors.append(f"Final synthesis LLM error: {exc}")
         logger.exception("Final synthesis LLM error: %s", exc)

@@ -9,7 +9,9 @@ dependencies = [
   "elasticsearch>=8.14.0,<9.0.0",
   "sentence-transformers>=3.0.0",
   "transformers>=4.40.0",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
 ]
 
 [tool.setuptools.packages.find]
-include = ["nodes*", "llm*", "tools*", "scripts*"]
+include = ["nodes*", "llm*", "tools*"]
