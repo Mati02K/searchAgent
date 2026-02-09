@@ -35,6 +35,7 @@ class GeminiLLM:
                 contents = f"SYSTEM:\n{system}\n\nUSER:\n{prompt}"
             else:
                 contents = prompt
+            logger.info("Gemini generate payload:\n%s", contents)
 
             response = self.client.models.generate_content(
                 model=self.model,

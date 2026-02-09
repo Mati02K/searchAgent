@@ -5,13 +5,14 @@ This folder provides local Elasticsearch infrastructure for SearchAgent retrieva
 ## What it does
 
 - Runs Elasticsearch as a separate Docker container.
-- Initializes an index named `search_documents`.
+- Initializes a vector index named `search_vectors_general`.
 - Stores arXiv/Wikipedia documents with fields:
   - `source`
   - `title`
   - `content`
   - `url`
   - `domain_tags`
+  - `embedding` (`dense_vector`)
 
 ## Start
 
@@ -34,11 +35,12 @@ Set these for the Python app:
 
 ```bash
 ELASTICSEARCH_URL=http://localhost:9200
-ELASTICSEARCH_INDEX=search_documents
+ELASTICSEARCH_INDEX=search_vectors
+ELASTICSEARCH_INDEX_PREFIX=search_vectors
 ```
 
 ## Verify
 
 ```bash
-curl -s http://localhost:9200/search_documents | jq
+curl -s http://localhost:9200/search_vectors_general | jq
 ```

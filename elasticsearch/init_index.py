@@ -7,7 +7,8 @@ import urllib.request
 
 
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200").rstrip("/")
-ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX", "search_documents")
+ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX", "search_vectors_general")
+VECTOR_EMBED_DIMS = int(os.getenv("VECTOR_EMBED_DIMS", "384"))
 
 INDEX_MAPPING = {
     "mappings": {
@@ -19,6 +20,12 @@ INDEX_MAPPING = {
             "domain_tags": {"type": "keyword"},
             "published": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
             "authors": {"type": "keyword"},
+            "embedding": {
+                "type": "dense_vector",
+                "dims": VECTOR_EMBED_DIMS,
+                "index": True,
+                "similarity": "cosine",
+            },
         }
     }
 }

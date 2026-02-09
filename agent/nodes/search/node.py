@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 
 from logging_utils import get_logger
@@ -7,6 +8,7 @@ from nodes.prompt import FINAL_SYNTHESIS_SYSTEM_PROMPT, build_final_synthesis_pr
 from nodes.state import AgentState
 
 logger = get_logger(__name__)
+MIN_SOURCES_FOR_LLM = max(1, int(os.getenv("MIN_SOURCES_FOR_LLM", "4")))
 
 
 def _dedupe_sources(sources: list[dict]) -> list[dict]:
@@ -58,6 +60,28 @@ def search_node(state: AgentState) -> dict:
     ]
 
     report = ""
+    if len(sources) < MIN_SOURCES_FOR_LLM:
+        errors.append(
+            f"Insufficient high-confidence sources for synthesis: {len(sources)} < {MIN_SOURCES_FOR_LLM}."
+        )
+        report = (
+            "# Unable to Answer\n\n"
+            "Insufficient high-confidence sources were retrieved to generate a reliable report.\n\n"
+            f"- Required minimum sources: {MIN_SOURCES_FOR_LLM}\n"
+            f"- Retrieved sources: {len(sources)}\n"
+        )
+        logger.warning(
+            "Skipping LLM synthesis due to insufficient sources. sources=%d min_required=%d",
+            len(sources),
+            MIN_SOURCES_FOR_LLM,
+        )
+        return {
+            "sources": sources,
+            "evidence": evidence,
+            "report": report,
+            "errors": errors,
+        }
+
     try:
         from llm.factory import get_llm
 

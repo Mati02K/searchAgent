@@ -31,7 +31,8 @@ services:
     command: ["python", "init_index.py"]
     environment:
       - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - ELASTICSEARCH_INDEX=search_documents
+      - ELASTICSEARCH_INDEX=search_vectors_general
+      - VECTOR_EMBED_DIMS=384
 
 volumes:
   es-data:

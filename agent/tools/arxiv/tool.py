@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -14,64 +16,90 @@ logger = get_logger(__name__)
 ARXIV_API_ENDPOINT = os.getenv(
     "ARXIV_API_ENDPOINT", "https://export.arxiv.org/api/query"
 )
+ARXIV_API_ENDPOINTS = tuple(
+    endpoint.strip()
+    for endpoint in os.getenv(
+        "ARXIV_API_ENDPOINTS",
+        ",".join(
+            [
+                ARXIV_API_ENDPOINT,
+                "https://arxiv.org/api/query",
+                "http://export.arxiv.org/api/query",
+            ]
+        ),
+    ).split(",")
+    if endpoint.strip()
+)
 ARXIV_ATOM_NAMESPACE = os.getenv("ARXIV_ATOM_NAMESPACE", "http://www.w3.org/2005/Atom")
 ATOM_NS = {"atom": ARXIV_ATOM_NAMESPACE}
-ARXIV_RETRY_ATTEMPTS = max(1, int(os.getenv("ARXIV_RETRY_ATTEMPTS", "4")))
-ARXIV_BACKOFF_BASE_SECONDS = float(os.getenv("ARXIV_BACKOFF_BASE_SECONDS", "1.0"))
-ARXIV_REQUEST_DELAY_SECONDS = float(os.getenv("ARXIV_REQUEST_DELAY_SECONDS", "1.0"))
+ARXIV_REQUEST_DELAY_SECONDS = float(os.getenv("ARXIV_REQUEST_DELAY_SECONDS", "0.0"))
+ARXIV_HTTP_TIMEOUT_SECONDS = float(os.getenv("ARXIV_HTTP_TIMEOUT_SECONDS", "10.0"))
 
 
-def _http_get_text(url: str, timeout: float = 10.0) -> str:
+def _http_get_text(url: str, timeout: float = ARXIV_HTTP_TIMEOUT_SECONDS) -> str:
     started_at = time.perf_counter()
-    last_exc: Exception | None = None
-    for attempt in range(1, ARXIV_RETRY_ATTEMPTS + 1):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "SearchAgent/0.1 (MCP arXiv Tool)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            logger.info(
+                "arXiv HTTP fetch success. attempt=1 status=%s elapsed_ms=%.2f",
+                getattr(response, "status", "unknown"),
+                (time.perf_counter() - started_at) * 1000,
+            )
+            return text
+    except urllib.error.HTTPError as exc:
+        body_snippet = ""
         try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "SearchAgent/0.1 (MCP arXiv Tool)"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                text = response.read().decode("utf-8", errors="replace")
-                logger.info(
-                    "arXiv HTTP fetch success. attempt=%d elapsed_ms=%.2f",
-                    attempt,
-                    (time.perf_counter() - started_at) * 1000,
-                )
-                return text
-        except urllib.error.HTTPError as exc:
-            last_exc = exc
-            status = int(getattr(exc, "code", 0))
-            if status == 429 or status >= 500:
-                backoff = ARXIV_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    "arXiv request throttled/failed. status=%s attempt=%d/%d backoff=%.2fs",
-                    status,
-                    attempt,
-                    ARXIV_RETRY_ATTEMPTS,
-                    backoff,
-                )
-                time.sleep(backoff)
-                continue
-            raise
-        except Exception as exc:
-            last_exc = exc
-            backoff = ARXIV_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-            logger.warning(
-                "arXiv request error. attempt=%d/%d backoff=%.2fs error=%s",
-                attempt,
-                ARXIV_RETRY_ATTEMPTS,
-                backoff,
-                exc,
-            )
-            time.sleep(backoff)
-    if last_exc is not None:
+            body_snippet = exc.read(512).decode("utf-8", errors="replace")
+        except Exception:
+            body_snippet = ""
         logger.error(
-            "arXiv HTTP fetch failed after retries. attempts=%d elapsed_ms=%.2f",
-            ARXIV_RETRY_ATTEMPTS,
+            "arXiv HTTP error. status=%s reason=%s url=%s body_snippet=%r elapsed_ms=%.2f",
+            exc.code,
+            exc.reason,
+            url,
+            body_snippet,
             (time.perf_counter() - started_at) * 1000,
         )
-        raise last_exc
-    raise RuntimeError("arXiv request failed without exception details.")
+        raise
+    except urllib.error.URLError as exc:
+        logger.error(
+            "arXiv URL error. reason=%s url=%s elapsed_ms=%.2f",
+            exc.reason,
+            url,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        raise
+    except TimeoutError as exc:
+        logger.error(
+            "arXiv timeout error. timeout=%s url=%s error=%s elapsed_ms=%.2f",
+            timeout,
+            url,
+            exc,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        raise
+    except socket.timeout as exc:
+        logger.error(
+            "arXiv socket timeout. timeout=%s url=%s error=%s elapsed_ms=%.2f",
+            timeout,
+            url,
+            exc,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        raise
+    except Exception as exc:
+        logger.exception(
+            "arXiv HTTP fetch unexpected failure. url=%s error=%s elapsed_ms=%.2f",
+            url,
+            exc,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        raise
 
 
 def _find_best_url(entry: ET.Element, fallback: str) -> str:
@@ -86,6 +114,17 @@ def _find_best_url(entry: ET.Element, fallback: str) -> str:
         if href and rel == "alternate":
             return href
     return fallback
+
+
+def _build_search_url(endpoint: str, query: str, max_results: int) -> str:
+    params = {
+        "search_query": f"all:{query}",
+        "start": "0",
+        "max_results": str(max_results),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    return f"{endpoint}?{urllib.parse.urlencode(params)}"
 
 
 def search_arxiv(query: str, limit: int = 5) -> list[dict]:
@@ -109,26 +148,51 @@ def search_arxiv(query: str, limit: int = 5) -> list[dict]:
     except Exception:
         max_results = 5
 
-    params = {
-        "search_query": f"all:{cleaned_query}",
-        "start": "0",
-        "max_results": str(max_results),
-        "sortBy": "relevance",
-        "sortOrder": "descending",
-    }
-    url = f"{ARXIV_API_ENDPOINT}?{urllib.parse.urlencode(params)}"
-    logger.info("arXiv search start. query=%s limit=%d", cleaned_query, max_results)
+    logger.info(
+        "arXiv search start. query=%s limit=%d endpoints=%s timeout=%.1fs",
+        cleaned_query,
+        max_results,
+        list(ARXIV_API_ENDPOINTS),
+        ARXIV_HTTP_TIMEOUT_SECONDS,
+    )
     if ARXIV_REQUEST_DELAY_SECONDS > 0:
         time.sleep(ARXIV_REQUEST_DELAY_SECONDS)
 
-    try:
-        xml_text = _http_get_text(url)
-        root = ET.fromstring(xml_text)
-    except Exception as exc:
-        logger.exception(
-            "arXiv search failed. query=%s error=%s elapsed_ms=%.2f",
+    root: ET.Element | None = None
+    last_error: Exception | None = None
+    selected_url = ""
+    for endpoint in ARXIV_API_ENDPOINTS:
+        selected_url = _build_search_url(endpoint, cleaned_query, max_results)
+        try:
+            xml_text = _http_get_text(selected_url, timeout=ARXIV_HTTP_TIMEOUT_SECONDS)
+            root = ET.fromstring(xml_text)
+            logger.info("arXiv endpoint success. endpoint=%s", endpoint)
+            break
+        except ET.ParseError as exc:
+            last_error = exc
+            logger.error(
+                "arXiv XML parse failure. query=%s endpoint=%s error=%s elapsed_ms=%.2f",
+                cleaned_query,
+                endpoint,
+                exc,
+                (time.perf_counter() - started_at) * 1000,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "arXiv endpoint failed. query=%s endpoint=%s error=%s elapsed_ms=%.2f",
+                cleaned_query,
+                endpoint,
+                exc,
+                (time.perf_counter() - started_at) * 1000,
+            )
+
+    if root is None:
+        logger.error(
+            "arXiv search failed (all endpoints, fail-silent). query=%s last_url=%s error=%s elapsed_ms=%.2f",
             cleaned_query,
-            exc,
+            selected_url,
+            last_error,
             (time.perf_counter() - started_at) * 1000,
         )
         return []

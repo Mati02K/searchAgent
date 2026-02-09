@@ -4,7 +4,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import os
 import re
 import time
-from functools import lru_cache
 
 from logging_utils import get_logger
 from nodes.state import AgentState
@@ -18,17 +17,18 @@ from tools.elasticsearch_backend import (
 from tools.wikipedia.tool import search_wikipedia
 
 DEFAULT_CANDIDATE_LIMIT = 80
-MIN_CANDIDATES_BEFORE_BACKFILL = 20
 DEFAULT_TOP_K = 8
-RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-ES_INDEX_PREFIX = os.getenv("ELASTICSEARCH_INDEX_PREFIX", os.getenv("ELASTICSEARCH_INDEX", "search_documents"))
+DEFAULT_VECTOR_MIN_SIMILARITY = 0.45
+DEFAULT_MIN_SOURCES_FOR_LLM = 6
+ES_INDEX_PREFIX = os.getenv(
+    "ELASTICSEARCH_INDEX_PREFIX",
+    os.getenv("ELASTICSEARCH_INDEX", "search_vectors"),
+)
 BACKFILL_MAX_QUERIES = max(1, min(8, int(os.getenv("BACKFILL_MAX_QUERIES", "4"))))
 WIKIPEDIA_BACKFILL_WORKERS = max(
     1, min(8, int(os.getenv("WIKIPEDIA_BACKFILL_WORKERS", "3")))
 )
-ARXIV_BACKFILL_WORKERS = max(
-    1, min(4, int(os.getenv("ARXIV_BACKFILL_WORKERS", "2")))
-)
+ARXIV_BACKFILL_WORKERS = max(1, min(4, int(os.getenv("ARXIV_BACKFILL_WORKERS", "2"))))
 logger = get_logger(__name__)
 ARXIV_STOPWORDS = {
     "a",
@@ -72,40 +72,43 @@ def _normalize_doc(raw: dict) -> dict:
         "published": raw.get("published"),
         "authors": raw.get("authors"),
         "domain_tags": raw.get("domain_tags") or [],
+        "score": float(raw.get("score") or 0.0),
     }
 
 
-def _rules_from_state(state: AgentState) -> tuple[list[str], list[str]]:
-    control = state.get("planner_control", {})
-    rules = control.get("relevance_rules", {}) if isinstance(control, dict) else {}
-    must_include = [str(item).strip().lower() for item in rules.get("must_include", []) if str(item).strip()]
-    must_exclude = [str(item).strip().lower() for item in rules.get("must_exclude", []) if str(item).strip()]
-    return must_include, must_exclude
+def _score_to_similarity(score: float) -> float:
+    """
+    returns similarity score
+    """
+    return max(0.0, min(1.0, float(score or 0.0)))
 
 
-def _index_names_from_state(state: AgentState) -> tuple[str, list[str]]:
-    control = state.get("planner_control", {})
-    target_key = "general"
-    if isinstance(control, dict):
-        target_key = str(control.get("target_index_key", "general")).strip().lower() or "general"
-    primary_index = f"{ES_INDEX_PREFIX}_{target_key}"
-    fallback_indexes: list[str] = []
-    general_index = f"{ES_INDEX_PREFIX}_general"
-    if primary_index != general_index:
-        fallback_indexes.append(general_index)
-    return primary_index, fallback_indexes
-
-
-def _apply_rule_filters(docs: list[dict], must_include: list[str], must_exclude: list[str]) -> list[dict]:
+def _apply_min_similarity_filter(docs: list[dict], min_similarity: float) -> list[dict]:
     filtered: list[dict] = []
     for doc in docs:
-        text = f"{doc.get('title', '')} {doc.get('content', '')}".lower()
-        if any(term in text for term in must_exclude):
-            continue
-        if must_include and not any(term in text for term in must_include):
-            continue
-        filtered.append(doc)
+        similarity = _score_to_similarity(float(doc.get("score", 0.0)))
+        doc["similarity"] = similarity
+        logger.info(
+            "Doc similarity computed. title='%s' url='%s' score=%.4f similarity=%.4f",
+            doc.get("title", ""),
+            doc.get("url", ""),
+            float(doc.get("score", 0.0)),
+            similarity,
+        )
+        if similarity >= min_similarity:
+            filtered.append(doc)
     return filtered
+
+
+def _sort_docs_by_score(docs: list[dict]) -> list[dict]:
+    docs.sort(
+        key=lambda doc: (
+            -float(doc.get("similarity", _score_to_similarity(float(doc.get("score", 0.0))))),
+            str(doc.get("title", "")),
+            str(doc.get("url", "")),
+        )
+    )
+    return docs
 
 
 def _dedupe_docs(docs: list[dict], limit: int) -> list[dict]:
@@ -198,7 +201,11 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
     ) as arxiv_pool:
         for query_idx, query in enumerate(selected_queries):
             logger.info("API backfill queue wikipedia query[%d]='%s'", query_idx, query)
-            wiki_future = wiki_pool.submit(search_wikipedia, query=query, limit=per_query_limit)
+            wiki_future = wiki_pool.submit(
+                search_wikipedia,
+                query=query,
+                limit=per_query_limit,
+            )
             queued_tasks.append((query_idx, 0, "wikipedia", query, wiki_future))
 
             arxiv_query = _shorten_for_arxiv(query)
@@ -208,7 +215,11 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
                 arxiv_query,
                 query,
             )
-            arxiv_future = arxiv_pool.submit(search_arxiv, query=arxiv_query, limit=per_query_limit)
+            arxiv_future = arxiv_pool.submit(
+                search_arxiv,
+                query=arxiv_query,
+                limit=per_query_limit,
+            )
             queued_tasks.append((query_idx, 1, "arxiv", arxiv_query, arxiv_future))
 
         fetched_count_by_tool = {"wikipedia": 0, "arxiv": 0}
@@ -254,31 +265,26 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
 
 def _retrieve_candidates_from_es(
     queries: list[str],
-    must_include: list[str],
-    must_exclude: list[str],
     target_limit: int,
     primary_index: str,
-    fallback_indexes: list[str],
 ) -> tuple[list[dict], list[str]]:
     started_at = time.perf_counter()
     errors: list[str] = []
     logger.info(
-        "ES retrieval start. primary_index=%s fallback_indexes=%s target_limit=%d query_count=%d must_include=%d must_exclude=%d",
+        "Vector retrieval start. index=%s target_limit=%d query_count=%d",
         primary_index,
-        fallback_indexes,
         target_limit,
         len(queries),
-        len(must_include),
-        len(must_exclude),
     )
+
     client = get_client()
     if client is None:
-        errors.append("Elasticsearch client unavailable. Falling back to API hydration only.")
+        errors.append("Elasticsearch client unavailable.")
         logger.warning(
             "Elasticsearch client unavailable. elapsed_ms=%.2f",
             (time.perf_counter() - started_at) * 1000,
         )
-        return _fetch_from_apis(queries), errors
+        return [], errors
 
     if not ensure_index(client, index_name=primary_index):
         errors.append(f"Elasticsearch index unavailable: {primary_index}.")
@@ -287,211 +293,232 @@ def _retrieve_candidates_from_es(
             primary_index,
             (time.perf_counter() - started_at) * 1000,
         )
-        return _fetch_from_apis(queries), errors
-    for fallback_index in fallback_indexes:
-        ensure_index(client, index_name=fallback_index)
+        return [], errors
 
     candidates: list[dict] = []
     per_query_size = max(10, min(50, target_limit))
-    index_names = [primary_index, *fallback_indexes]
     for query in queries[:6]:
-        for index_name in index_names:
-            results = search_documents(
-                client,
-                query,
-                size=per_query_size,
-                index_name=index_name,
-                must_include=must_include,
-                must_exclude=must_exclude,
-            )
-            candidates.extend(_normalize_doc(item) for item in results)
+        results = search_documents(
+            client,
+            query,
+            size=per_query_size,
+            index_name=primary_index,
+        )
+        candidates.extend(_normalize_doc(item) for item in results)
 
-    candidates = _dedupe_docs(candidates, limit=target_limit)
+    candidates = _sort_docs_by_score(_dedupe_docs(candidates, limit=target_limit))
     logger.info(
-        "ES initial retrieval complete. candidates=%d elapsed_ms=%.2f",
+        "Vector initial retrieval complete. candidates=%d elapsed_ms=%.2f",
         len(candidates),
         (time.perf_counter() - started_at) * 1000,
     )
-    if len(candidates) >= MIN_CANDIDATES_BEFORE_BACKFILL:
-        logger.info(
-            "ES retrieval complete without backfill. elapsed_ms=%.2f",
-            (time.perf_counter() - started_at) * 1000,
-        )
-        return candidates, errors
-
-    fetched = _fetch_from_apis(queries)
-    if fetched:
-        indexed = index_documents(
-            client,
-            docs=[
-                {
-                    "source": item.get("source", ""),
-                    "title": item.get("title", ""),
-                    "content": item.get("content", ""),
-                    "url": item.get("url", ""),
-                    "domain_tags": item.get("domain_tags", []),
-                    "published": item.get("published"),
-                    "authors": item.get("authors"),
-                }
-                for item in fetched
-            ],
-            index_name=primary_index,
-        )
-        if indexed <= 0:
-            errors.append("Failed to index hydrated documents into Elasticsearch.")
-            logger.warning("Backfill indexing failed. indexed=%d", indexed)
-        else:
-            logger.info("Backfill indexing complete. indexed=%d", indexed)
-
-        requeried: list[dict] = []
-        for query in queries[:6]:
-            for index_name in index_names:
-                results = search_documents(
-                    client,
-                    query,
-                    size=per_query_size,
-                    index_name=index_name,
-                    must_include=must_include,
-                    must_exclude=must_exclude,
-                )
-                requeried.extend(_normalize_doc(item) for item in results)
-        if requeried:
-            candidates = _dedupe_docs(requeried, limit=target_limit)
-            logger.info("Requery after backfill complete. candidates=%d", len(candidates))
-        else:
-            candidates = _dedupe_docs(fetched, limit=target_limit)
-            logger.info("Using fetched fallback docs without ES requery. candidates=%d", len(candidates))
-
     logger.info(
-        "ES retrieval complete with backfill. elapsed_ms=%.2f",
+        "Vector retrieval complete. elapsed_ms=%.2f",
         (time.perf_counter() - started_at) * 1000,
     )
     return candidates, errors
 
 
-def _lexical_score(query: str, doc: dict) -> float:
-    query_terms = {term for term in query.lower().split() if term}
-    text_terms = set(f"{doc.get('title', '')} {doc.get('content', '')}".lower().split())
-    if not query_terms:
-        return 0.0
-    return len(query_terms & text_terms) / max(1, len(query_terms))
-
-
-@lru_cache(maxsize=1)
-def _get_reranker():
-    from sentence_transformers import CrossEncoder
-
-    return CrossEncoder(RERANK_MODEL_NAME)
-
-
-def _rerank(query: str, docs: list[dict], errors: list[str]) -> list[dict]:
+def _backfill_index_from_apis(
+    *,
+    queries: list[str],
+    primary_index: str,
+) -> tuple[list[dict], list[str]]:
+    """
+    Call external tools and index returned documents into Elasticsearch.
+    """
     started_at = time.perf_counter()
-    if not docs:
-        logger.warning("Rerank skipped: no docs.")
-        return []
+    errors: list[str] = []
 
-    try:
-        logger.info("Cross-encoder rerank start. model=%s docs=%d", RERANK_MODEL_NAME, len(docs))
-        reranker = _get_reranker()
-        pairs = [(query, f"{doc.get('title', '')} {doc.get('content', '')}") for doc in docs]
-        scores = reranker.predict(pairs)
-        for idx, score in enumerate(scores):
-            docs[idx]["rerank_score"] = float(score)
+    fetched = _fetch_from_apis(queries)
+    if not fetched:
+        errors.append("API backfill returned no results.")
+        logger.warning("API backfill returned no results.")
+        return [], errors
+
+    client = get_client()
+    if client is None:
+        errors.append("Elasticsearch client unavailable during backfill indexing.")
+        logger.warning("Elasticsearch client unavailable during backfill indexing.")
+        return fetched, errors
+
+    if not ensure_index(client, index_name=primary_index):
+        errors.append(f"Elasticsearch index unavailable during backfill: {primary_index}.")
+        logger.warning("Elasticsearch index unavailable during backfill. index=%s", primary_index)
+        return fetched, errors
+
+    indexed = index_documents(
+        client,
+        docs=[
+            {
+                "source": item.get("source", ""),
+                "title": item.get("title", ""),
+                "content": item.get("content", ""),
+                "url": item.get("url", ""),
+                "domain_tags": item.get("domain_tags", []),
+                "published": item.get("published"),
+                "authors": item.get("authors"),
+            }
+            for item in fetched
+        ],
+        index_name=primary_index,
+    )
+    if indexed <= 0:
+        errors.append("Failed to index backfilled documents into Elasticsearch.")
+        logger.warning("Backfill indexing failed. indexed=%d", indexed)
+    else:
         logger.info(
-            "Cross-encoder rerank complete. elapsed_ms=%.2f",
+            "Backfill indexing complete. indexed=%d elapsed_ms=%.2f",
+            indexed,
             (time.perf_counter() - started_at) * 1000,
         )
-    except Exception as exc:
-        errors.append(f"Cross-encoder unavailable: {exc}")
-        logger.exception("Cross-encoder unavailable; falling back to lexical scoring: %s", exc)
-        for doc in docs:
-            doc["rerank_score"] = _lexical_score(query, doc)
 
-    docs.sort(
-        key=lambda doc: (
-            -float(doc.get("rerank_score", 0.0)),
-            str(doc.get("title", "")),
-            str(doc.get("url", "")),
-        )
+    return fetched, errors
+
+
+def _retrieve_and_filter_candidates(
+    *,
+    queries: list[str],
+    target_limit: int,
+    primary_index: str,
+    min_similarity: float,
+) -> tuple[list[dict], list[str], int]:
+    """
+    Run ES retrieval followed by min-similarity filtering.
+
+    Returns:
+    - filtered candidates
+    - retrieval errors
+    - original candidate count before filtering
+    """
+    candidates, retrieval_errors = _retrieve_candidates_from_es(
+        queries=queries,
+        target_limit=target_limit,
+        primary_index=primary_index,
     )
-    logger.info("Rerank ordering complete. elapsed_ms=%.2f", (time.perf_counter() - started_at) * 1000)
-    return docs
+    original_candidates = list(candidates)
+    filtered = _apply_min_similarity_filter(
+        docs=original_candidates,
+        min_similarity=min_similarity,
+    )
+    logger.info(
+        "Min-similarity filter applied. before=%d after=%d min_similarity=%.2f",
+        len(original_candidates),
+        len(filtered),
+        min_similarity,
+    )
+    return filtered, retrieval_errors, len(original_candidates)
 
 
 def reranker_node(state: AgentState) -> dict:
     """
-    Retrieval + ML reranking node.
+    Vector retrieval node.
 
     Planner emits deterministic control object; this node performs:
-    1) ES retrieval
-    2) API backfill + index when ES is sparse
-    3) Cross-encoder reranking
+    1) Vector retrieval from Elasticsearch
+    2) API backfill + index when vector index is sparse
+    3) Vector requery and top-k selection
     """
     started_at = time.perf_counter()
     errors = list(state.get("errors", []))
     prompt = (state.get("prompt") or "").strip()
     queries = [str(item).strip() for item in state.get("queries", []) if str(item).strip()]
-    must_include, must_exclude = _rules_from_state(state)
-    primary_index, fallback_indexes = _index_names_from_state(state)
-    candidate_limit = max(50, min(100, int(os.getenv("RERANK_CANDIDATE_LIMIT", str(DEFAULT_CANDIDATE_LIMIT)))))
-    top_k = max(6, min(10, int(os.getenv("RERANK_TOP_K", str(DEFAULT_TOP_K)))))
+    primary_index = f"{ES_INDEX_PREFIX}_general"
+
+    candidate_limit = max(
+        50,
+        min(
+            100,
+            int(
+                os.getenv(
+                    "VECTOR_CANDIDATE_LIMIT",
+                    os.getenv("RERANK_CANDIDATE_LIMIT", str(DEFAULT_CANDIDATE_LIMIT)),
+                )
+            ),
+        ),
+    )
+    top_k = max(
+        1,
+        min(
+            20,
+            int(os.getenv("VECTOR_TOP_K", os.getenv("RERANK_TOP_K", str(DEFAULT_TOP_K)))),
+        ),
+    )
+    min_similarity = max(
+        0.0,
+        min(1.0, float(os.getenv("VECTOR_MIN_SIMILARITY", str(DEFAULT_VECTOR_MIN_SIMILARITY)))),
+    )
+    min_sources_for_llm = max(
+        1,
+        min(
+            top_k,
+            int(os.getenv("MIN_SOURCES_FOR_LLM", str(DEFAULT_MIN_SOURCES_FOR_LLM))),
+        ),
+    )
 
     if not queries and prompt:
         queries = [prompt]
     logger.info(
-        "Reranker node start. trace_id=%s prompt_len=%d queries=%d primary_index=%s fallback_indexes=%s",
+        "Vector node start. trace_id=%s prompt_len=%d queries=%d index=%s",
         state.get("trace_id", ""),
         len(prompt),
         len(queries),
         primary_index,
-        fallback_indexes,
     )
 
-    candidates, retrieval_errors = _retrieve_candidates_from_es(
+    filtered, retrieval_errors, _ = _retrieve_and_filter_candidates(
         queries=queries,
-        must_include=must_include,
-        must_exclude=must_exclude,
         target_limit=candidate_limit,
         primary_index=primary_index,
-        fallback_indexes=fallback_indexes,
+        min_similarity=min_similarity,
     )
     errors.extend(retrieval_errors)
-    original_candidates = list(candidates)
-    prefilter_count = len(original_candidates)
-    candidates = _apply_rule_filters(original_candidates, must_include, must_exclude)
-    logger.info(
-        "Rule filter applied. before=%d after=%d must_include=%s must_exclude=%s",
-        prefilter_count,
-        len(candidates),
-        must_include,
-        must_exclude,
-    )
-    if prefilter_count > 0 and not candidates:
-        # Avoid complete collapse from over-strict include rules.
-        logger.warning("Rule filters removed all candidates; relaxing include filter.")
-        candidates = _apply_rule_filters(
-            docs=original_candidates,
-            must_include=[],
-            must_exclude=must_exclude,
-        )
 
-    ranked = _rerank(prompt, candidates, errors)
-    top_docs = ranked[:top_k]
+    # Backfill is triggered only when filtered results are below minimum.
+    if len(filtered) < min_sources_for_llm:
+        logger.info(
+            "Filtered candidates below minimum for synthesis. filtered=%d min_sources_for_llm=%d. Running API backfill and using tool results directly.",
+            len(filtered),
+            min_sources_for_llm,
+        )
+        backfill_docs, backfill_errors = _backfill_index_from_apis(
+            queries=queries,
+            primary_index=primary_index,
+        )
+        errors.extend(backfill_errors)
+
+        if backfill_docs:
+            filtered = _sort_docs_by_score(
+                _dedupe_docs(
+                    docs=[_normalize_doc(doc) for doc in backfill_docs if isinstance(doc, dict)],
+                    limit=candidate_limit,
+                )
+            )
+            logger.info(
+                "Using tool results directly after backfill. candidates=%d",
+                len(filtered),
+            )
+
+    filtered = _sort_docs_by_score(filtered)
+
+    top_docs = filtered[:top_k]
     logger.info(
-        "Reranker complete. candidates=%d top_docs=%d errors=%d elapsed_ms=%.2f",
-        len(candidates),
+        "Vector node complete. candidates=%d top_docs=%d min_sources_for_llm=%d min_similarity=%.2f errors=%d elapsed_ms=%.2f",
+        len(filtered),
         len(top_docs),
+        min_sources_for_llm,
+        min_similarity,
         len(errors),
         (time.perf_counter() - started_at) * 1000,
     )
+
     if not top_docs:
         logger.warning(
-            "No top docs produced. prompt='%s' queries=%s must_include=%s must_exclude=%s",
+            "No top docs produced. prompt='%s' queries=%s",
             prompt,
             queries,
-            must_include,
-            must_exclude,
         )
+
     sources = [
         {
             "title": doc.get("title", ""),
@@ -513,7 +540,7 @@ def reranker_node(state: AgentState) -> dict:
     ]
 
     return {
-        "candidates": candidates,
+        "candidates": filtered,
         "sources": sources,
         "evidence": evidence,
         "errors": errors,

@@ -8,12 +8,6 @@ from nodes.state import AgentState
 
 DEFAULT_SECTIONS = ["definition", "benefits", "risks", "evaluation", "judgment"]
 DEFAULT_TOOLS = ["elasticsearch"]
-DEFAULT_TOPIC_INDEX_KEY = "general"
-TOPIC_INDEX_KEYS = {"llm", "networking", "general"}
-LLM_TEXT_MUST_INCLUDE = ["llm", "large language model", "text"]
-LLM_TEXT_MUST_EXCLUDE = ["vision", "video", "tabular", "gesture"]
-NETWORKING_MUST_INCLUDE = ["network", "routing", "latency", "bandwidth", "throughput", "tcp", "ip"]
-NETWORKING_MUST_EXCLUDE = ["llm", "large language model", "synthetic data"]
 STOPWORDS = {
     "a",
     "an",
@@ -88,68 +82,6 @@ def _build_queries(prompt: str, sections: list[str]) -> list[str]:
     return deduped
 
 
-def _build_relevance_rules(prompt: str) -> dict[str, list[str]]:
-    lowered = (prompt or "").lower()
-    if "llm" in lowered or "language model" in lowered or "text" in lowered:
-        return {
-            "must_include": list(LLM_TEXT_MUST_INCLUDE),
-            "must_exclude": list(LLM_TEXT_MUST_EXCLUDE),
-        }
-    if any(
-        keyword in lowered
-        for keyword in (
-            "network",
-            "routing",
-            "tcp",
-            "ip",
-            "bandwidth",
-            "throughput",
-            "packet",
-            "latency",
-            "dns",
-            "http",
-        )
-    ):
-        return {
-            "must_include": list(NETWORKING_MUST_INCLUDE),
-            "must_exclude": list(NETWORKING_MUST_EXCLUDE),
-        }
-
-    keywords = _top_keywords(prompt, max_items=3)
-    return {
-        "must_include": keywords,
-        "must_exclude": [],
-    }
-
-
-def _choose_topic_index_key(prompt: str, relevance_rules: dict[str, list[str]]) -> str:
-    lowered = (prompt or "").lower()
-    if "llm" in lowered or "language model" in lowered or "synthetic data" in lowered:
-        return "llm"
-    if any(
-        keyword in lowered
-        for keyword in (
-            "network",
-            "routing",
-            "tcp",
-            "ip",
-            "bandwidth",
-            "throughput",
-            "packet",
-            "latency",
-            "dns",
-            "http",
-        )
-    ):
-        return "networking"
-    includes = {item.lower() for item in relevance_rules.get("must_include", [])}
-    if {"llm", "large language model"} & includes:
-        return "llm"
-    if {"network", "routing", "tcp", "ip", "latency"} & includes:
-        return "networking"
-    return DEFAULT_TOPIC_INDEX_KEY
-
-
 def planner_node(state: AgentState) -> dict:
     """
     Deterministic planner node.
@@ -160,10 +92,6 @@ def planner_node(state: AgentState) -> dict:
     prompt = (state.get("prompt") or "").strip()
     errors = list(state.get("errors", []))
     sections = list(DEFAULT_SECTIONS)
-    relevance_rules = _build_relevance_rules(prompt)
-    topic_index_key = _choose_topic_index_key(prompt, relevance_rules)
-    if topic_index_key not in TOPIC_INDEX_KEYS:
-        topic_index_key = DEFAULT_TOPIC_INDEX_KEY
     queries = _build_queries(prompt, sections)
     logger.info(
         "Planner start. trace_id=%s prompt_len=%d",
@@ -182,16 +110,11 @@ def planner_node(state: AgentState) -> dict:
         "intent": "research",
         "sections": sections,
         "tools": list(DEFAULT_TOOLS),
-        "relevance_rules": relevance_rules,
-        "target_index_key": topic_index_key,
     }
     logger.info(
-        "Planner control emitted. target_index_key=%s sections=%s queries=%d must_include=%s must_exclude=%s elapsed_ms=%.2f",
-        topic_index_key,
+        "Planner control emitted. sections=%s queries=%d elapsed_ms=%.2f",
         sections,
         len(queries),
-        relevance_rules.get("must_include", []),
-        relevance_rules.get("must_exclude", []),
         (time.perf_counter() - started_at) * 1000,
     )
 
