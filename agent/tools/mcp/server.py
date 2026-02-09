@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,10 +208,10 @@ def _handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
         return _build_error_response(request_id, -32601, f"Method not found: {method}")
     except Exception as exc:
         print(f"[mcp] error handling request: {exc}")
-        return _build_error_response(None, -32603, f"Internal error: {exc}")    
+        return _build_error_response(None, -32603, f"Internal error: {exc}")
 
 
-def serve() -> None:
+def serve_stdio() -> None:
     while True:
         try:
             message = _read_message()
@@ -223,5 +225,83 @@ def serve() -> None:
             break
 
 
+class _MCPHTTPHandler(BaseHTTPRequestHandler):
+    def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            self._write_json(200, {"status": "ok"})
+            return
+        self._write_json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/rpc":
+            self._write_json(404, {"error": "not_found"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            content_length = 0
+        if content_length <= 0:
+            self._write_json(400, _build_error_response(None, -32600, "Empty request body"))
+            return
+
+        raw = self.rfile.read(content_length)
+        try:
+            message = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            self._write_json(400, _build_error_response(None, -32700, f"Parse error: {exc}"))
+            return
+
+        if not isinstance(message, dict):
+            self._write_json(400, _build_error_response(None, -32600, "Invalid Request"))
+            return
+
+        response = _handle_request(message)
+        if response is None:
+            self.send_response(204)
+            self.end_headers()
+            return
+        self._write_json(200, response)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[mcp-http] {self.address_string()} - {format % args}")
+
+
+def serve_http(host: str = "0.0.0.0", port: int = 8765) -> None:
+    server = ThreadingHTTPServer((host, port), _MCPHTTPHandler)
+    print(f"[mcp-http] listening on http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SearchAgent MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Server transport mode.",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind host.")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP bind port.")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    serve()
+    args = _parse_args()
+    if args.transport == "http":
+        serve_http(host=args.host, port=args.port)
+    else:
+        serve_stdio()

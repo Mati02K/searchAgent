@@ -15,7 +15,7 @@ class TransformersSafetyClassifier(SafetyClassifier):
     """
     Mandatory model-based safety classifier.
 
-    This classifier must initialize successfully; otherwise execution should fail.
+    The goal of this model is to provide a guard
     """
 
     def __init__(
@@ -103,7 +103,7 @@ class TransformersSafetyClassifier(SafetyClassifier):
 
 
 @lru_cache(maxsize=1)
-def get_mandatory_model_classifier() -> SafetyClassifier:
+def get_model_classifier() -> SafetyClassifier:
     model_name = os.getenv("SAFETY_MODEL_NAME", "unitary/toxic-bert")
     threshold = float(os.getenv("SAFETY_MODEL_THRESHOLD", "0.75"))
     return TransformersSafetyClassifier(model_name=model_name, threshold=threshold)

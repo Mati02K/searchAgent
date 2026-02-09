@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from nodes.safety.base import SafetyClassifier, SafetyResult
-from nodes.safety.classifiers import get_mandatory_model_classifier
+from nodes.safety.classifiers import get_model_classifier
 
 
 class SafetyAgentService:
@@ -14,7 +14,7 @@ class SafetyAgentService:
 
     def _get_model_classifier(self) -> SafetyClassifier:
         if self._model_classifier is None:
-            self._model_classifier = get_mandatory_model_classifier()
+            self._model_classifier = get_model_classifier()
         return self._model_classifier
 
     def evaluate(self, prompt: str) -> SafetyResult:

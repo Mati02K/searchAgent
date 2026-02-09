@@ -1,0 +1,65 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: search-agent-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    networks:
+      - search-agent-net
+
+  mcp-server:
+    container_name: search-agent-mcp
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    env_file:
+      - ./agent/.env
+    command: ["uv", "run", "python", "-m", "tools.mcp.server", "--transport", "http", "--host", "0.0.0.0", "--port", "8765"]
+    ports:
+      - "8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    networks:
+      - search-agent-net
+
+  search-agent:
+    container_name: search-agent
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+    env_file:
+      - ./agent/.env
+    volumes:
+      - ./logs:/workspace/logs
+    stdin_open: true
+    tty: true
+    command: ["uv", "run", "python", "-m", "scripts.run_graph_smoke", "--debug"]
+    networks:
+      - search-agent-net
+
+volumes:
+  es-data:
+
+networks:
+  search-agent-net:
+    driver: bridge

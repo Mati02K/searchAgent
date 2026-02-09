@@ -1,0 +1,14 @@
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+agent/.venv
+agent/search_agent.egg-info
+agent/logs
+logs
+
+tests
+api

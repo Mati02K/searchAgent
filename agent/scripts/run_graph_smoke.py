@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 from logging_utils import get_logger
-from nodes.graph import run_graph
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -30,6 +29,8 @@ EXIT_COMMANDS = {"exit"}
 
 
 def _run_once(prompt: str, debug: bool) -> None:
+    from nodes.graph import run_graph
+
     logger.info("Smoke run start. prompt_len=%d", len(prompt))
     state = run_graph(prompt)
     logger.info(
@@ -40,7 +41,8 @@ def _run_once(prompt: str, debug: bool) -> None:
     )
     print(state["report"])
     if debug:
-        log_file = os.getenv("SEARCH_AGENT_LOG_FILE", "logs/search_agent.log")
+        default_log = str(Path(__file__).resolve().parents[2] / "logs" / "search_agent.log")
+        log_file = os.getenv("SEARCH_AGENT_LOG_FILE", default_log)
         print("\n[debug] errors:", state.get("errors", []))
         print(
             f"[debug] log_file: {Path.cwd() / log_file if not Path(log_file).is_absolute() else Path(log_file)}"

@@ -17,9 +17,14 @@ This folder provides local Elasticsearch infrastructure for SearchAgent retrieva
 ## Start
 
 ```bash
-cd elasticsearch
-docker compose up -d
+cd ..
+docker compose up --build -d
 ```
+
+The root `docker-compose.yml` starts:
+- `elasticsearch`
+- `es-init` (index bootstrap)
+- `search-agent`
 
 The `es-init` service creates the index automatically after Elasticsearch is healthy.
 

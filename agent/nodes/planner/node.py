@@ -86,7 +86,13 @@ def planner_node(state: AgentState) -> dict:
     """
     Deterministic planner node.
 
-    Emits control data only. No LLM calls, no ranking.
+    Emits control data only. This is a just a sample planner agent
+    This adds the list of queries to search like this
+    1. current user prompt
+    2. current user prompt + each section name (e.g. "benefits", "risks" etc)
+    3. top keywords from the user prompt (after removing stopwords)
+    
+    In real system, I hope to replace this with a planner which can better the user query and also give useful tools to scrape info about.
     """
     started_at = time.perf_counter()
     prompt = (state.get("prompt") or "").strip()

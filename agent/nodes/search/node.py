@@ -11,24 +11,6 @@ logger = get_logger(__name__)
 MIN_SOURCES_FOR_LLM = max(1, int(os.getenv("MIN_SOURCES_FOR_LLM", "4")))
 
 
-def _dedupe_sources(sources: list[dict]) -> list[dict]:
-    deduped: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in sources:
-        if not isinstance(item, dict):
-            continue
-        key = (
-            str(item.get("source", "")),
-            str(item.get("url", "")),
-            str(item.get("title", "")),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped
-
-
 def search_node(state: AgentState) -> dict:
     """
     Final synthesis node.
@@ -49,7 +31,7 @@ def search_node(state: AgentState) -> dict:
         sections,
     )
 
-    sources = _dedupe_sources(state.get("sources", []))
+    sources = [item for item in state.get("sources", []) if isinstance(item, dict)]
     evidence = [
         {
             "statement": item.get("summary", ""),
@@ -99,6 +81,7 @@ def search_node(state: AgentState) -> dict:
     except Exception as exc:
         errors.append(f"Final synthesis LLM error: {exc}")
         logger.exception("Final synthesis LLM error: %s", exc)
+        report = ("# Error Generating Report\n\n. Please try after sometime !")
 
     logger.info(
         "Search synthesis complete. sources=%d evidence=%d report_len=%d errors=%d elapsed_ms=%.2f",

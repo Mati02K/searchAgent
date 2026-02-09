@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import math
 import os
 import re
 import time
 
 from logging_utils import get_logger
 from nodes.state import AgentState
-from tools.arxiv.tool import search_arxiv
-from tools.elasticsearch_backend import (
+from tools.elasticsearch_backend.store import (
     ensure_index,
     get_client,
     index_documents,
     search_documents,
 )
-from tools.wikipedia.tool import search_wikipedia
+from tools.mcp.client import call_mcp_tool
 
 DEFAULT_CANDIDATE_LIMIT = 80
 DEFAULT_TOP_K = 8
@@ -24,12 +24,9 @@ ES_INDEX_PREFIX = os.getenv(
     "ELASTICSEARCH_INDEX_PREFIX",
     os.getenv("ELASTICSEARCH_INDEX", "search_vectors"),
 )
-BACKFILL_MAX_QUERIES = max(1, min(8, int(os.getenv("BACKFILL_MAX_QUERIES", "4"))))
-WIKIPEDIA_BACKFILL_WORKERS = max(
-    1, min(8, int(os.getenv("WIKIPEDIA_BACKFILL_WORKERS", "3")))
-)
-ARXIV_BACKFILL_WORKERS = max(1, min(4, int(os.getenv("ARXIV_BACKFILL_WORKERS", "2"))))
-logger = get_logger(__name__)
+BACKFILL_MAX_QUERIES = min(8, int(os.getenv("BACKFILL_MAX_QUERIES", "4")))
+WIKIPEDIA_BACKFILL_WORKERS = min(8, int(os.getenv("WIKIPEDIA_BACKFILL_WORKERS", "3")))
+ARXIV_BACKFILL_WORKERS = min(4, int(os.getenv("ARXIV_BACKFILL_WORKERS", "2")))
 ARXIV_STOPWORDS = {
     "a",
     "an",
@@ -61,6 +58,8 @@ ARXIV_STOPWORDS = {
     "focus",
 }
 
+logger = get_logger(__name__)
+
 
 def _normalize_doc(raw: dict) -> dict:
     return {
@@ -78,9 +77,14 @@ def _normalize_doc(raw: dict) -> dict:
 
 def _score_to_similarity(score: float) -> float:
     """
-    returns similarity score
+    Return Elasticsearch relevance score as similarity-like value.
+
+    We keep the raw score and only guard against non-finite values.
     """
-    return max(0.0, min(1.0, float(score or 0.0)))
+    value = float(score or 0.0)
+    if math.isnan(value) or math.isinf(value):
+        return 0.0
+    return value
 
 
 def _apply_min_similarity_filter(docs: list[dict], min_similarity: float) -> list[dict]:
@@ -130,6 +134,8 @@ def _dedupe_docs(docs: list[dict], limit: int) -> list[dict]:
 
 
 def _shorten_for_arxiv(query: str) -> str:
+    # doing this to get relevant papers.
+    
     text = " ".join((query or "").strip().lower().split())
     if not text:
         return ""
@@ -191,6 +197,9 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
         )
         return []
 
+    # using thread to speed up the process of getting,
+    # in real ideal scenario, I want the cron-job to do this work and keep the index warm, so the latency won't be a problem.
+    
     queued_tasks: list[tuple[int, int, str, str, Future]] = []
     with ThreadPoolExecutor(
         max_workers=WIKIPEDIA_BACKFILL_WORKERS,
@@ -202,9 +211,10 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
         for query_idx, query in enumerate(selected_queries):
             logger.info("API backfill queue wikipedia query[%d]='%s'", query_idx, query)
             wiki_future = wiki_pool.submit(
-                search_wikipedia,
-                query=query,
-                limit=per_query_limit,
+                call_mcp_tool,
+                "wikipedia_search",
+                query,
+                per_query_limit,
             )
             queued_tasks.append((query_idx, 0, "wikipedia", query, wiki_future))
 
@@ -216,9 +226,10 @@ def _fetch_from_apis(queries: list[str], per_query_limit: int = 8) -> list[dict]
                 query,
             )
             arxiv_future = arxiv_pool.submit(
-                search_arxiv,
-                query=arxiv_query,
-                limit=per_query_limit,
+                call_mcp_tool,
+                "arxiv_search",
+                arxiv_query,
+                per_query_limit,
             )
             queued_tasks.append((query_idx, 1, "arxiv", arxiv_query, arxiv_future))
 
@@ -268,6 +279,7 @@ def _retrieve_candidates_from_es(
     target_limit: int,
     primary_index: str,
 ) -> tuple[list[dict], list[str]]:
+    
     started_at = time.perf_counter()
     errors: list[str] = []
     logger.info(
@@ -327,6 +339,7 @@ def _backfill_index_from_apis(
     """
     Call external tools and index returned documents into Elasticsearch.
     """
+    
     started_at = time.perf_counter()
     errors: list[str] = []
 
@@ -385,11 +398,9 @@ def _retrieve_and_filter_candidates(
 ) -> tuple[list[dict], list[str], int]:
     """
     Run ES retrieval followed by min-similarity filtering.
-
-    Returns:
-    - filtered candidates
-    - retrieval errors
-    - original candidate count before filtering
+    
+    So this searches for candidates in Elasticsearch and applies a minimum similarity filter to ensure relevance. 
+    It returns the filtered candidates, any retrieval errors, and the original candidate count before filtering.
     """
     candidates, retrieval_errors = _retrieve_candidates_from_es(
         queries=queries,
@@ -425,35 +436,18 @@ def reranker_node(state: AgentState) -> dict:
     queries = [str(item).strip() for item in state.get("queries", []) if str(item).strip()]
     primary_index = f"{ES_INDEX_PREFIX}_general"
 
-    candidate_limit = max(
-        50,
-        min(
-            100,
-            int(
-                os.getenv(
-                    "VECTOR_CANDIDATE_LIMIT",
-                    os.getenv("RERANK_CANDIDATE_LIMIT", str(DEFAULT_CANDIDATE_LIMIT)),
-                )
-            ),
-        ),
+    candidate_limit = int(
+        os.getenv(
+            "VECTOR_CANDIDATE_LIMIT",
+            os.getenv("RERANK_CANDIDATE_LIMIT", str(DEFAULT_CANDIDATE_LIMIT)),
+        )
     )
-    top_k = max(
-        1,
-        min(
-            20,
-            int(os.getenv("VECTOR_TOP_K", os.getenv("RERANK_TOP_K", str(DEFAULT_TOP_K)))),
-        ),
+    top_k = int(os.getenv("VECTOR_TOP_K", os.getenv("RERANK_TOP_K", str(DEFAULT_TOP_K))))
+    min_similarity = float(
+        os.getenv("VECTOR_MIN_SIMILARITY", str(DEFAULT_VECTOR_MIN_SIMILARITY))
     )
-    min_similarity = max(
-        0.0,
-        min(1.0, float(os.getenv("VECTOR_MIN_SIMILARITY", str(DEFAULT_VECTOR_MIN_SIMILARITY)))),
-    )
-    min_sources_for_llm = max(
-        1,
-        min(
-            top_k,
-            int(os.getenv("MIN_SOURCES_FOR_LLM", str(DEFAULT_MIN_SOURCES_FOR_LLM))),
-        ),
+    min_sources_for_llm = int(
+        os.getenv("MIN_SOURCES_FOR_LLM", str(DEFAULT_MIN_SOURCES_FOR_LLM))
     )
 
     if not queries and prompt:

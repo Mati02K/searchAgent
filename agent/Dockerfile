@@ -1,22 +1,18 @@
-FROM python:3.11-slim
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install uv
-RUN pip install --no-cache-dir uv
+WORKDIR /workspace/agent
 
-# Set working directory INSIDE container
-WORKDIR /agent
+# Copy dependency metadata first for build cache efficiency.
+COPY agent/pyproject.toml /workspace/agent/pyproject.toml
 
-# Copy dependency metadata first (layer caching)
-COPY pyproject.toml .
+# Copy the agent source.
+COPY agent /workspace/agent
 
-# Install dependencies into system Python
-RUN uv pip install --system .
+# Install project dependencies via uv (no pip usage).
+RUN uv pip install --system /workspace/agent
 
-# Copy the rest of the code
-COPY . .
-
-# Default command: run smoke test
-CMD ["python", "-m", "test"]
+# Temporary default entrypoint for smoke execution.
+CMD ["uv", "run", "python", "-m", "scripts.run_graph_smoke"]
