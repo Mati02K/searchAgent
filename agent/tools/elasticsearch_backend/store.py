@@ -10,9 +10,7 @@ from tools.elasticsearch_backend.embeddings import embed_text, embed_texts, embe
 
 ES_INDEX_NAME = os.getenv("ELASTICSEARCH_INDEX", "search_vectors")
 DEFAULT_ES_URL = "http://localhost:9200"
-VECTOR_NUM_CANDIDATES_FACTOR = max(
-    1, int(os.getenv("VECTOR_NUM_CANDIDATES_FACTOR", "4"))
-)
+VECTOR_NUM_CANDIDATES_FACTOR = int(os.getenv("VECTOR_NUM_CANDIDATES_FACTOR", "4"))
 logger = get_logger(__name__)
 
 
